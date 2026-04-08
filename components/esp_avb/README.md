@@ -9,15 +9,15 @@ Current features:
 - run talker and listener simultaneously
 - up to 2 channels per stream
 - AAF PCM audio
-- up to 24 bit audio
-- up to 96 kHz sample rate
+- 24 bit audio
+- 48 kHz sample rate
 
 Tested with:
 
 - ESP32-P4 and ES8311 codec
-- Waveshare ESP32 P4 Nano board
+- Waveshare ESP32-P4-ETH board (onboard mic and speaker)
 - MOTU AVB switch
-- Apple Mac Mini M1
+- Apple Mac Mini M1 and M4
 - Sonnet Thunderbolt AVB Adapter
 - Hive AVB Controller
 
