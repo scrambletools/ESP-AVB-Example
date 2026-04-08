@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 Scramble Tools
+ * Copyright 2024-2026 Scramble Tools
  * License: MIT
  *
  * AVB Example Application
@@ -9,11 +9,11 @@
  */
 
 #include "esp_avb.h"
+#include "esp_eth_clock.h"
 #include <driver/gpio.h>
 #include <esp_check.h>
 #include <esp_eth.h>
 #include <esp_eth_phy_ip101.h>
-#include <esp_eth_time.h>
 #include <esp_event.h>
 #include <esp_intr_alloc.h>
 #include <esp_log.h>
@@ -39,12 +39,6 @@ static bool s_gpio_level;
 esp_eth_handle_t eth_handle;
 char avb_interface[10];
 
-/* Import music file as buffer */
-#if CONFIG_EXAMPLE_AVB_TALKER
-extern const uint8_t music_pcm_start[] asm("_binary_canon_half_pcm_start");
-extern const uint8_t music_pcm_end[] asm("_binary_canon_half_pcm_end");
-#endif
-
 /* Initialize Ethernet and netif on all available ports */
 void init_ethernet_and_netif(void) {
 
@@ -57,8 +51,9 @@ void init_ethernet_and_netif(void) {
   // Increase DMA buffer size and count
   emac_config.dma_burst_len = ETH_DMA_BURST_LEN_32;
   emac_config.intr_priority = 0; // 0 = use default priority
-  mac_config.rx_task_stack_size = 16384; // Room for I2S writes in EMAC RX callback
-  mac_config.rx_task_prio = 22;         // Above AVB main task (21)
+  mac_config.rx_task_stack_size =
+      16384;                    // Room for I2S writes in EMAC RX callback
+  mac_config.rx_task_prio = 22; // Above AVB main task (21)
   // Set PHY address (usually 0 or 1, check your hardware)
   phy_config.phy_addr = 1;
   phy_config.reset_gpio_num = 5; // GPIO number for PHY reset
@@ -114,8 +109,6 @@ void app_main(void) {
   avb_config_s avb_config = AVB_DEFAULT_CONFIG();
 #if CONFIG_EXAMPLE_AVB_TALKER
   avb_config.talker = true;
-  avb_config.pcm_data = music_pcm_start;
-  avb_config.pcm_data_length = music_pcm_end - music_pcm_start;
 #endif
 #if CONFIG_EXAMPLE_AVB_LISTENER
   avb_config.listener = true;
