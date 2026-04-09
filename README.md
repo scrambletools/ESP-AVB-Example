@@ -16,6 +16,7 @@ Currently supports:
 - control via ATDECC controller
 
 Anticipated future support:
+- ES8388/9 instrument module (to be designed)
 - AVB over Wifi (class B streams)
 - AVB 'lite' (works with any switch, no bandwidth guarantee)
 - AES67
