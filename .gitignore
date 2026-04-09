@@ -3,6 +3,7 @@ build.clang/
 components/
 managed_components/
 reference/
+releases/
 .vscode/
 *.lock
 sdkconfig
