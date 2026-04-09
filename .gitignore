@@ -1,5 +1,6 @@
 build/
 build.clang/
+components/
 managed_components/
 reference/
 .vscode/
@@ -7,6 +8,4 @@ reference/
 sdkconfig
 .DS_Store
 *.old
-CLAUDE.md
-.claude/
 sdkconfig.old

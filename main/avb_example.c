@@ -101,7 +101,7 @@ void app_main(void) {
   int pid = ptpd_start(avb_interface);
 
   /* Wait for the clock to be available */
-  while (esp_eth_clock_gettime(CLOCK_PTP_SYSTEM, &cur_time) == -1) {
+  while (clock_gettime(CLOCK_PTP_SYSTEM, &cur_time) == -1) {
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 
