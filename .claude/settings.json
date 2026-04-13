@@ -11,6 +11,7 @@
       "Bash(echo *)",
       "Bash(grep *)",
       "Bash(source *)",
+      "Bash(ifconfig *)",
       "Bash(ip link *)",
       "Bash(dumpcap *)",
       "Bash(timeout *)",

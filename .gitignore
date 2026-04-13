@@ -5,6 +5,7 @@ managed_components/
 reference/
 releases/
 .vscode/
+.claude/
 *.lock
 sdkconfig
 .DS_Store

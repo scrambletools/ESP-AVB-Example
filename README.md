@@ -1,8 +1,14 @@
 # ESP AVB Example Talker & Listener
 
- An example AVB talker and listener implementation using the esp_avb component for ESP-IDF.
+An example AVB talker and listener implementation using the esp_avb component for ESP-IDF.
 
-This implementation is based on the following standards:
+Hardware:
+
+- Currently only the ESP32-P4 is supported as it has IEEE1588 hardware timestamp
+- Scramble offers developer hardware with this firmware pre-loaded at www.scramble.tools
+- You can get a Waveshare ESP32-P4-ETH from other vendors and flash it yourself.
+
+This AVB implementation is based on the following standards:
 
 - IEEE 1722-2016 (AVTP)
 - IEEE 1722.1-2021 (ATDECC)
