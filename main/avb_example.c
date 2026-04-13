@@ -34,8 +34,6 @@ typedef struct {
 } task_info_t;
 
 static const char *TAG = "avb_example";
-static struct timespec s_next_time;
-static bool s_gpio_level;
 esp_eth_handle_t eth_handle;
 char avb_interface[10];
 
@@ -134,21 +132,6 @@ void app_main(void) {
 
   vTaskDelay(pdMS_TO_TICKS(3000));
 
-  /* After AVB is started, you can set additional codec options */
-  // MUST USE EVENT TO MAKE SURE CODEC IS INITIALIZED, THEN USE STATUS TO GET
-  // CODEC HANDLE void *codec_handle = avb_get_codec_handle(); if (codec_handle)
-  // {
-  //     if (avb_config.talker) {
-  //         esp_codec_dev_set_in_gain(codec_handle, 30.0);
-  //     }
-  //     if (avb_config.listener) {
-  //         esp_codec_dev_set_out_vol(codec_handle, 60.0);
-  //     }
-  // }
-
-  /* Register callback function for time pulse indicator LED */
-  // esp_eth_clock_register_target_cb(CLOCK_PTP_SYSTEM, ts_callback);
-
   /* Task handles for memory consumption monitoring */
   static const uint task_monitor_period = 1000;    // wait between checks in ms
   static const uint task_monitor_threshold = 1000; // size of high watermark
@@ -162,12 +145,6 @@ void app_main(void) {
   /* Main loop */
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(task_monitor_period));
-
-    struct ptpd_status_s ptp_status;
-    // If valid PTP status
-    if (ptpd_status(pid, &ptp_status) == 0) {
-      // Do something with the PTP status
-    }
 
     ESP_LOGI(TAG, "heartbeat");
 

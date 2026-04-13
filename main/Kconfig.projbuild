@@ -16,7 +16,7 @@ menu "AVB Example Configuration"
 
     config EXAMPLE_AVB_TALKER
         bool "Enable AVB Talker"
-        default n
+        default y
         help
             Function as AVB Talker.
 
@@ -25,7 +25,7 @@ menu "AVB Example Configuration"
         depends on EXAMPLE_AVB_TALKER
         default n
         help
-            Automatically start streaming when link is up.
+            Automatically start streaming when link is up. (not implemented yet)
       
     choice EXAMPLE_SELECT_MIC_GAIN
         prompt "Set MIC gain"
@@ -75,7 +75,7 @@ menu "AVB Example Configuration"
         depends on EXAMPLE_AVB_LISTENER
         default n
         help
-            Automatically connect to an AVB Talker with the same entity model ID.
+            Automatically connect to an AVB Talker with the same entity model ID. (not implemented yet)
       
     config EXAMPLE_AVB_SPEAKER_VOLUME
         int "Speaker volume"
