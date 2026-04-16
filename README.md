@@ -19,14 +19,15 @@ Currently supports:
 
 - AVB talker and listener
 - simultaneous input and output stream
-- class A streams (125 microsecond latency)
-- 24/48 in AAF or AM824
-- control via ATDECC controller
+- class A streams
+- 24bit/48kHz in AAF or AM824
+- control via ATDECC controller (tested with Hive)
 
 Anticipated future support:
 
 - ES8388/9 instrument module (to be designed)
 - Milan certification
+- AVB community audio profile support (in draft)
 - AVB over Wifi (class B streams)
 - AVB 'lite' (works with any switch, no bandwidth guarantee)
 - AES67
