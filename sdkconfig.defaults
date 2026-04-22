@@ -1,5 +1,11 @@
 CONFIG_IDF_TARGET="esp32p4"
 
+# The hardware on /dev/ttyACM0 is chip rev v1.3 — enable the pre-v3 option
+# set and pick the v1.0 minimum so the built binary boots on v1.x silicon.
+# IDF default is v3.1+ which produces bootloaders that refuse to run on v1.x.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
@@ -17,6 +23,15 @@ CONFIG_NETUTILS_PTPD_SERVERPRIO=100
 CONFIG_NETUTILS_PTPD_TIMEOUT_MS=10000
 CONFIG_NETUTILS_PTPD_SETTIME_THRESHOLD_MS=100
 
+# gPTP standard intervals (IEEE 802.1AS-2020 + Milan): sync 125 ms,
+# announce 1 s. These override esp_ptp Kconfig defaults of 1000/10000
+# which were too slow for Class A audio. The sync interval also controls
+# the ptpd poll() timeout (PTPD_POLL_INTERVAL in ptpd.c) — at 1000 ms
+# idle windows in the ptpd-late diagnostic looked like 1-second task
+# starvations when they were just poll() timeouts.
+CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS=125
+CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS=1000
+
 CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n
 
 CONFIG_FREERTOS_ISR_STACKSIZE=6144
@@ -33,8 +48,29 @@ CONFIG_ETH_TRANSMIT_MUTEX=n
 
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 
+# Include xCoreID in TaskStatus_t — required by avbstats.c per-task
+# CPU diagnostic so it can show which core each task ran on.
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+
+# Keep EMAC RX critical sections and forwarder in IRAM so they continue
+# executing during NVS writes that disable the flash cache. Without this,
+# the emac_rx task stalls on every NVS save and we lose ~20 ms of audio.
+CONFIG_ETH_IRAM_OPTIMIZATION=y
+
+# Disable task WDT for CPU0 idle task during MSRP flap bursts where
+# emac_rx + AVB-IN can briefly saturate core 0. IDLE1 WDT also disabled
+# above for the busy-wait AVB-OUT case.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+
 # Increase EMAC DMA RX buffers and L2TAP queue for high-bandwidth AVB
 # listener streams (8000 pkt/sec for Class A 8-channel AM824).
 CONFIG_ETH_DMA_RX_BUFFER_NUM=30
 CONFIG_ESP_NETIF_L2_TAP_RX_QUEUE_SIZE=64
-CONFIG_ETH_DMA_BUFFER_SIZE=512
+# Buffer size 1536 covers the full 1518 B ethernet MTU (+64-byte align).
+# At the old 512 B each AAF audio frame (~810 B) needed 2 buffers, cutting
+# the effective ring depth in half. With 1536 each frame = 1 buffer, so
+# the 30-slot ring holds ~30 audio frames (~3.8 ms at 8000 pps). Hardware
+# missed_fc counter showed ~1300 frames/sec dropped at 512 under sustained
+# stream load — this doubles the headroom without touching ETH_SOFT_FLOW_
+# CONTROL (which would emit 802.3x PAUSE frames, forbidden on AVB ports).
+CONFIG_ETH_DMA_BUFFER_SIZE=1536
