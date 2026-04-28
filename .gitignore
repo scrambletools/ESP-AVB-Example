@@ -6,6 +6,7 @@ reference/
 releases/
 .vscode/
 .claude/
+.codex
 *.lock
 sdkconfig
 .DS_Store
