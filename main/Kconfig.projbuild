@@ -28,41 +28,34 @@ menu "AVB Example Configuration"
             Automatically start streaming when link is up. (not implemented yet)
       
     choice EXAMPLE_SELECT_MIC_GAIN
-        prompt "Set MIC gain"
+        prompt "Default MIC gain"
         depends on EXAMPLE_AVB_TALKER
-        default MIC_GAIN_18DB
+        default MIC_GAIN_6DB
         help
-            Select mic gain for echo mode.
+            Select a codec-independent default mic gain. The AVB component
+            clamps and rounds this to the nearest value supported by the
+            selected codec.
 
         config MIC_GAIN_0DB
-            bool "0dB"
+            bool "0 dB"
         config MIC_GAIN_6DB
-            bool "6dB"
+            bool "6 dB"
         config MIC_GAIN_12DB
-            bool "12dB"
+            bool "12 dB"
         config MIC_GAIN_18DB
-            bool "18dB"
+            bool "18 dB"
         config MIC_GAIN_24DB
-            bool "24dB"
-        config MIC_GAIN_30DB
-            bool "30dB"
-        config MIC_GAIN_36DB
-            bool "36dB"
-        config MIC_GAIN_42DB
-            bool "42dB"
+            bool "24 dB"
     endchoice
       
-    config EXAMPLE_AVB_MIC_GAIN
+    config EXAMPLE_AVB_MIC_GAIN_TENTH_DB
         depends on EXAMPLE_AVB_TALKER
         int
         default 0 if MIC_GAIN_0DB
-        default 1 if MIC_GAIN_6DB
-        default 2 if MIC_GAIN_12DB
-        default 3 if MIC_GAIN_18DB
-        default 4 if MIC_GAIN_24DB
-        default 5 if MIC_GAIN_30DB
-        default 6 if MIC_GAIN_36DB
-        default 7 if MIC_GAIN_42DB
+        default 60 if MIC_GAIN_6DB
+        default 120 if MIC_GAIN_12DB
+        default 180 if MIC_GAIN_18DB
+        default 240 if MIC_GAIN_24DB
 
     config EXAMPLE_AVB_LISTENER
         bool "Enable AVB Listener"
@@ -77,18 +70,21 @@ menu "AVB Example Configuration"
         help
             Automatically connect to an AVB Talker with the same entity model ID. (not implemented yet)
       
-    config EXAMPLE_AVB_SPEAKER_VOLUME
-        int "Speaker volume"
+    config EXAMPLE_AVB_SPEAKER_VOL_TENTH_DB
+        int "Default speaker volume (tenths of dB)"
         depends on EXAMPLE_AVB_LISTENER
-        range 0 100
-        default 80
+        range -955 0
+        default -100
         help
-            Set the volume of the speaker.
+            Set a codec-independent default speaker digital volume in tenths
+            of dB. For example, -100 is -10.0 dB and 0 is 0.0 dB. The AVB
+            component clamps and rounds this to the nearest value supported
+            by the selected codec.
 
     config EXAMPLE_AVB_REMOTE_CONTROL
         bool "Allow remote control via ATDECC"
         default y
         help
-            Allow an AVB Controller to control this device via ATDECC protocol.
+            Allow an AVB Controller to control this device via ATDECC protocol. If not set it will break Milan compliance.
 
 endmenu

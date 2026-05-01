@@ -24,10 +24,6 @@
 #include <sdkconfig.h>
 #include <string.h>
 
-/* Example config variables */
-#define AVB_SPEAKER_VOLUME CONFIG_EXAMPLE_AVB_SPEAKER_VOLUME
-#define AVB_MIC_GAIN CONFIG_EXAMPLE_AVB_MIC_GAIN
-
 typedef struct {
   char name[16];
   TaskHandle_t handle;
@@ -96,7 +92,7 @@ void app_main(void) {
   ESP_LOGI(TAG, "Ethernet started");
 
   /* Start PTP */
-  int pid = ptpd_start(avb_interface);
+  ptpd_start(avb_interface);
 
   /* Wait for the clock to be available */
   while (clock_gettime(CLOCK_PTP_SYSTEM, &cur_time) == -1) {
@@ -105,12 +101,13 @@ void app_main(void) {
 
   /* Set up the AVB configuration */
   avb_config_s avb_config = AVB_DEFAULT_CONFIG();
-#if CONFIG_EXAMPLE_AVB_TALKER
-  avb_config.talker = true;
-#endif
-#if CONFIG_EXAMPLE_AVB_LISTENER
-  avb_config.listener = true;
-#endif
+  avb_config.entity_name = CONFIG_EXAMPLE_AVB_ENTITY_NAME;
+  avb_config.model_id = CONFIG_EXAMPLE_AVB_MODEL_ID;
+  avb_config.talker = CONFIG_EXAMPLE_AVB_TALKER;
+  avb_config.listener = CONFIG_EXAMPLE_AVB_LISTENER;
+  avb_config.default_mic_gain_tenth_db = CONFIG_EXAMPLE_AVB_MIC_GAIN_TENTH_DB;
+  avb_config.default_speaker_vol_tenth_db = CONFIG_EXAMPLE_AVB_SPEAKER_VOL_TENTH_DB;
+  avb_config.atdecc_control = CONFIG_EXAMPLE_AVB_REMOTE_CONTROL;
 
   /* Set the Ethernet handle in the AVB config */
   avb_config.eth_handle = eth_handle;
