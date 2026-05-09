@@ -2,9 +2,9 @@
  * Copyright 2024-2026 Scramble Tools
  * License: MIT
  *
- * AVB Example Application
+ * AVB Example Application for ESP-IDF
  *
- * This application demonstrates the use of the ESP_AVB component
+ * This application demonstrates the use of the esp_avb component
  * to create an AVB talker and/or listener.
  */
 
@@ -106,7 +106,8 @@ void app_main(void) {
   avb_config.talker = CONFIG_EXAMPLE_AVB_TALKER;
   avb_config.listener = CONFIG_EXAMPLE_AVB_LISTENER;
   avb_config.default_mic_gain_tenth_db = CONFIG_EXAMPLE_AVB_MIC_GAIN_TENTH_DB;
-  avb_config.default_speaker_vol_tenth_db = CONFIG_EXAMPLE_AVB_SPEAKER_VOL_TENTH_DB;
+  avb_config.default_speaker_vol_tenth_db =
+      CONFIG_EXAMPLE_AVB_SPEAKER_VOL_TENTH_DB;
   avb_config.atdecc_control = CONFIG_EXAMPLE_AVB_REMOTE_CONTROL;
 
   /* Set the Ethernet handle in the AVB config */

@@ -1,5 +1,12 @@
 CompileFlags:
-  CompilationDatabase: build.clang/
+  # ESP-IDF writes compile_commands.json into build/ for this project.
+  # Keep this in sync with the active idf.py build directory.
+  CompilationDatabase: build/
+  Add:
+    # clangd does not fully expand ESP-IDF's GCC specs file, so point it at
+    # the C library headers that the build actually uses.
+    - -isystem
+    - /home/user/.espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/picolibc/include
   Remove:
     - -fno-shrink-wrap
     - -fstrict-volatile-bitfields
@@ -8,6 +15,9 @@ CompileFlags:
     - -fno-malloc-dce
     - -mtune=esp-base
     - -march=*
+    # Not needed by this app and clangd can emit a bogus diagnostic from
+    # esp_wifi/remote/scripts/ignore_extensions.h while indexing these headers.
+    - -I/home/user/Development/esp-idf/components/esp_wifi/remote/include/injected
 
 InlayHints:
   Enabled: false
