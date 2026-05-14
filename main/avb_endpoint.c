@@ -5,16 +5,18 @@
  * AVB Endpoint application for ESP-IDF.
  *
  * Single project that targets multiple endpoint configurations via
- * the esp_ptp per-port Kconfig taxonomy (MEDIUM × TYPE × WIFI_ROLE):
+ * the esp_ptp per-port Kconfig taxonomy
+ * (MEDIUM × HOST_IF × TYPE × WIFI_MODE × LINK_SPEED_MBPS):
  *
  *   - Wired endpoint (default, target esp32p4): PORT0 MEDIUM=ETHERNET,
- *     TYPE=PRIMARY. Full AVB stack on Ethernet.
+ *     HOST_IF=EMAC, TYPE=PRIMARY. Full AVB stack on Ethernet.
  *
  *   - Wireless endpoint (target esp32c6): PORT0 MEDIUM=WIFI,
- *     TYPE=PRIMARY, WIFI_ROLE=STA. Wi-Fi STA associates to the bridge,
- *     consumes beacon-IE FollowUpInformation, initiates FTM.
+ *     HOST_IF=AHB, TYPE=PRIMARY, WIFI_MODE=STA. Wi-Fi STA associates
+ *     to the bridge, consumes beacon-IE FollowUpInformation, initiates
+ *     FTM.
  *
- *   - Mixed endpoint (e.g. ETHERNET PRIMARY + WIFI_CP STA FAILOVER):
+ *   - Mixed endpoint (e.g. ETHERNET PRIMARY + WIFI/SDIO STA FAILOVER):
  *     future, both medium blocks fire.
  *
  * Per-medium blocks are gated with #ifdef on the relevant port-medium
@@ -37,8 +39,8 @@
 #include <esp_eth_phy_ip101.h>
 #include <esp_event.h>
 #include <esp_netif.h>
+#include <esp_ptp.h>
 #include <esp_vfs_l2tap.h>
-#include <ptpd.h>
 #endif
 
 #if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI) ||                               \
@@ -151,10 +153,9 @@ static void start_ethernet_endpoint(void) {
  * ===========================================================================
  * Wi-Fi STA associates to the bridge's SoftAP, consumes the bridge's
  * beacon Vendor IE (Path C FollowUpInformation), and runs an FTM
- * initiator burst at the §12.8.2 cadence. AVB stack (talker/listener,
- * ATDECC, codec) integration on this medium is Phase 6b — esp_avb's
- * hard esp_eth dep needs to be lifted before avb_start() is callable
- * here.
+ * initiator burst at the §12.8.2 cadence. The full AVB stack
+ * (talker/listener, ATDECC) runs on the Wi-Fi data plane via
+ * avb_start() with codec disabled.
  */
 #if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI) ||                               \
     defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI)

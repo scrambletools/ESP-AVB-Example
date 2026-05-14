@@ -5,13 +5,21 @@
 
 # Per-port topology — esp_ptp is the single source of truth; the
 # matching ESP_AVB_* mirrors are derived in esp_avb/Kconfig.projbuild.
-#   port 0: wifi (locally-attached radio), primary endpoint, STA role.
+#   port 0: wifi (native on-chip radio, host_if=ahb), primary endpoint,
+#           STA mode, ~150 Mbps negotiated cap.
 # Phase 6a brought up Wi-Fi + beacon-IE consumer + FTM initiator;
 # Phase 6b runs the full AVB stack on this port.
 CONFIG_ESP_PTP_NUM_PORTS=1
 CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI=y
+CONFIG_ESP_PTP_PORT0_HOST_IF_AHB=y
 CONFIG_ESP_PTP_PORT0_TYPE_PRIMARY=y
-CONFIG_ESP_PTP_PORT0_WIFI_ROLE_STA=y
+CONFIG_ESP_PTP_PORT0_WIFI_MODE_STA=y
+CONFIG_ESP_PTP_PORT0_LINK_SPEED_MBPS=150
+
+# Disable listener fast-connect on this build — it interferes with the
+# Phase 3 class-selection demo by re-binding with default (Class A) flags
+# within milliseconds of any controller-driven disconnect. Test-only.
+CONFIG_ESP_AVB_DISABLE_FAST_CONNECT=y
 
 # FTM: initiator on STA per IEEE 802.1AS-2020 §12.1.2 (slave initiates).
 # Responder also enabled so this board can serve as the AP-side test
