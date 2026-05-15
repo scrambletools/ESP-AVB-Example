@@ -30,8 +30,15 @@
 #include "sdkconfig.h"
 #include <esp_log.h>
 #include <string.h>
+/* esp_ptp public API and internal wire-format types. Both used in
+ * either-medium builds: the public API for ptpd_start_port etc., the
+ * internal types for the §12.7 Vendor IE parser. esp_ptp's
+ * CMakeLists exposes "." (for ptp.h) and "./include" (for esp_ptp.h)
+ * via INCLUDE_DIRS, and esp_ptp is in our PRIV_REQUIRES. */
+#include <esp_ptp.h>
+#include "ptp.h"
 
-#ifdef CONFIG_ESP_PTP_PORT0_MEDIUM_ETHERNET
+#ifdef CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS
 #include "esp_avb.h"
 #include "esp_eth_clock.h"
 #include <esp_check.h>
@@ -39,12 +46,11 @@
 #include <esp_eth_phy_ip101.h>
 #include <esp_event.h>
 #include <esp_netif.h>
-#include <esp_ptp.h>
 #include <esp_vfs_l2tap.h>
 #endif
 
-#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI) ||                               \
-    defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI)
+#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM) ||                               \
+    defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI_FTM)
 #include "esp_avb.h"
 #include "esp_event.h"
 #include "esp_mac.h"
@@ -60,7 +66,7 @@ static const char *TAG = "avb_endpoint";
  * ETHERNET medium (PORT0)
  * ===========================================================================
  */
-#ifdef CONFIG_ESP_PTP_PORT0_MEDIUM_ETHERNET
+#ifdef CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS
 
 static esp_eth_handle_t s_eth_handle;
 static char s_avb_eth_interface[10];
@@ -146,7 +152,7 @@ static void start_ethernet_endpoint(void) {
   avb_start(&avb_config);
 }
 
-#endif /* CONFIG_ESP_PTP_PORT0_MEDIUM_ETHERNET */
+#endif /* CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS */
 
 /* ===========================================================================
  * WIFI medium (PORT0 or PORT1), STA role
@@ -157,8 +163,8 @@ static void start_ethernet_endpoint(void) {
  * (talker/listener, ATDECC) runs on the Wi-Fi data plane via
  * avb_start() with codec disabled.
  */
-#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI) ||                               \
-    defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI)
+#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM) ||                               \
+    defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI_FTM)
 
 #define AVB_AP_SSID "ESP-AVB-Bridge"
 
@@ -176,7 +182,7 @@ static void start_ethernet_endpoint(void) {
  * documented minimum. Each burst runs frm_count FTM frames; allowed
  * values are 0(No pref), 16, 24, 32, 64. */
 #define AVB_FTM_BURST_PERIOD_100MS 2
-#define AVB_FTM_FRM_COUNT 32
+#define AVB_FTM_FRM_COUNT 16
 
 static EventGroupHandle_t s_wifi_events;
 #define BIT_STA_CONNECTED BIT0
@@ -212,12 +218,22 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
   case WIFI_EVENT_FTM_REPORT: {
     wifi_event_ftm_report_t *r = (wifi_event_ftm_report_t *)data;
     if (r->status == FTM_STATUS_SUCCESS) {
-      ESP_LOGI(TAG,
-               "FTM report: peer %02x:%02x:%02x:%02x:%02x:%02x  RTT_est=%u ns "
-               " entries=%u",
-               r->peer_mac[0], r->peer_mac[1], r->peer_mac[2], r->peer_mac[3],
-               r->peer_mac[4], r->peer_mac[5], (unsigned)r->rtt_est,
-               (unsigned)r->ftm_report_num_entries);
+      /* peer_delay = RTT/2, in nanoseconds. IDF surfaces rtt_est in
+       * picoseconds despite the docstring saying "Nano-Seconds" on
+       * older releases — verified against tshark on FTM action
+       * frames. Convert to ns and inject into ptpd. */
+      int64_t peer_delay_ns = (int64_t)r->rtt_est / 2;
+      int rc = ptpd_inject_peer_delay(0, peer_delay_ns);
+      static uint32_t s_seen = 0;
+      if ((++s_seen % 25) == 1) {
+        ESP_LOGI(TAG,
+                 "FTM report #%u: peer %02x:%02x:%02x:%02x:%02x:%02x "
+                 "RTT_est=%u ps  peer_delay=%lld ns  inject_rc=%d",
+                 (unsigned)s_seen, r->peer_mac[0], r->peer_mac[1],
+                 r->peer_mac[2], r->peer_mac[3], r->peer_mac[4],
+                 r->peer_mac[5], (unsigned)r->rtt_est,
+                 (long long)peer_delay_ns, rc);
+      }
       xEventGroupSetBits(s_wifi_events, BIT_FTM_REPORT_OK);
     } else {
       ESP_LOGW(TAG, "FTM session failed: status=%d", r->status);
@@ -230,9 +246,20 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
 }
 
 /* Vendor IE callback — fires for every Vendor IE in scanned/received
- * beacons and probe responses. Filters to our OUI + Type 0
- * (FollowUpInformation) and logs the size of the
- * payload. */
+ * beacons and probe responses. Filters to our OUI + Type 0 (§12.7
+ * "FollowUpInformation" Vendor IE) and decodes the embedded Follow_Up
+ * message.
+ *
+ * Per IEEE 802.1AS-2020 §12.7, the IE payload is an entire 802.1AS
+ * Follow_Up message: PTP common header (34 B, §10.6.2) +
+ * preciseOriginTimestamp (10 B, §11.4.4) + FollowUpInformation TLV
+ * (32 B, §11.4.4.3). Total = sizeof(ptp_follow_up_s) = 76 B.
+ *
+ * Today this is a validating decoder — it parses the wire bytes and
+ * periodically logs the structured fields. The next step is to feed
+ * the parsed Follow_Up into the local ptpd via ptpd_inject_sync(0,
+ * payload, 76) so it disciplines the STA's clock; that requires the
+ * daemon-side injection path to be wired up (tracked separately). */
 static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                          const uint8_t sa[6], const vendor_ie_data_t *vnd_ie,
                          int rssi) {
@@ -246,19 +273,92 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
       vnd_ie->vendor_oui_type != AVB_VENDOR_OUI_TYPE) {
     return;
   }
-  /* vnd_ie->length covers OUI(3) + type(1) + payload, so payload size
-   * is length - 4. */
+  /* vnd_ie->length covers OUI(3) + oui_type(1) + payload, so payload
+   * size is length - 4. */
   int payload_len = (int)vnd_ie->length - 4;
+  const uint8_t *payload = vnd_ie->payload;
+
   static uint32_t s_seen = 0;
-  if ((++s_seen % 50) == 1) {
-    ESP_LOGI(TAG,
-             "Beacon Vendor IE detected from %02x:%02x:%02x:%02x:%02x:%02x "
-             "(OUI %02x:%02x:%02x type %d, %d-byte payload, RSSI %d) "
-             "[seen %u]",
-             sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], AVB_VENDOR_OUI0,
-             AVB_VENDOR_OUI1, AVB_VENDOR_OUI2, AVB_VENDOR_OUI_TYPE, payload_len,
-             rssi, (unsigned)s_seen);
+  ++s_seen;
+
+  /* Validate size against an 802.1AS-2020 §12.7 Follow_Up payload. */
+  if (payload_len != (int)sizeof(struct ptp_follow_up_s)) {
+    if ((s_seen % 50) == 1) {
+      ESP_LOGW(TAG,
+               "Beacon Vendor IE from %02x:%02x:%02x:%02x:%02x:%02x: "
+               "payload %d B (expected %u for §12.7 Follow_Up). Skipped.",
+               sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], payload_len,
+               (unsigned)sizeof(struct ptp_follow_up_s));
+    }
+    return;
   }
+
+  const struct ptp_follow_up_s *fu = (const struct ptp_follow_up_s *)payload;
+  const struct ptp_header_s *h = &fu->header;
+
+  /* Sanity-check the messagetype nibble (low 4 bits) matches Follow_Up.
+   * In the gPTP profile the high nibble carries the gPTP majorSdoId; we
+   * mask it off before comparing. */
+  if ((h->messagetype & 0x0f) != 0x08 /* PTP_MSGTYPE_FOLLOW_UP */) {
+    if ((s_seen % 50) == 1) {
+      ESP_LOGW(TAG,
+               "Beacon Vendor IE payload messagetype 0x%02x, not Follow_Up; "
+               "skipped.",
+               h->messagetype);
+    }
+    return;
+  }
+
+  /* Decode and log every Nth beacon. RX timestamp would come from the
+   * radio for true §12 timing — esp_wifi_set_vendor_ie_cb doesn't
+   * surface it, so we settle for clock_gettime() at callback time
+   * (worse precision than FTM HW timestamps; matches our chosen
+   * carrier-deviation tradeoff). */
+  if ((s_seen % 50) == 1) {
+    /* sourcePortIdentity: 8-byte clockIdentity + 2-byte portNumber. */
+    const uint8_t *gm = h->sourceidentity;
+    uint16_t seq = ((uint16_t)h->sequenceid[0] << 8) | h->sequenceid[1];
+    /* correctionField (8 B, scaledNs): high 6 B = ns, low 2 B = 2^-16 ns. */
+    int64_t correction_ns = 0;
+    for (int i = 0; i < 6; i++) {
+      correction_ns = (correction_ns << 8) | h->correction[i];
+    }
+    /* preciseOriginTimestamp: 6-byte seconds + 4-byte nanoseconds. */
+    uint64_t secs = 0;
+    for (int i = 0; i < 6; i++) {
+      secs = (secs << 8) | fu->origintimestamp[i];
+    }
+    uint32_t nsecs = ((uint32_t)fu->origintimestamp[6] << 24) |
+                     ((uint32_t)fu->origintimestamp[7] << 16) |
+                     ((uint32_t)fu->origintimestamp[8] << 8) |
+                     (uint32_t)fu->origintimestamp[9];
+
+    ESP_LOGI(TAG,
+             "§12.7 Follow_Up @beacon from %02x:%02x:%02x:%02x:%02x:%02x "
+             "RSSI=%d seen=%u: GM clockIdentity=%02x:%02x:%02x:%02x:%02x:%02x:"
+             "%02x:%02x seqId=%u correction=%lld ns precTS=%llu.%09lu",
+             sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], rssi, (unsigned)s_seen,
+             gm[0], gm[1], gm[2], gm[3], gm[4], gm[5], gm[6], gm[7],
+             (unsigned)seq, (long long)correction_ns, (unsigned long long)secs,
+             (unsigned long)nsecs);
+  }
+
+  /* Deduplicate against the previous-seen IE. Beacons fire every
+   * ~100 ms (AP DTIM cadence) but the bridge only re-marshals the IE
+   * every Sync interval (125 ms by default). So most beacons re-carry
+   * the prior Sync's bytes; reprocessing them aliases the servo's
+   * rate estimate. Skip when the preciseOriginTimestamp is unchanged
+   * — that's the high-entropy field that always advances on a fresh
+   * marshal. */
+  static uint8_t s_last_origin_ts[10] = {0};
+  if (memcmp(s_last_origin_ts, fu->origintimestamp,
+             sizeof(s_last_origin_ts)) == 0) {
+    return;
+  }
+  memcpy(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts));
+
+  /* Feed the Follow_Up into ptpd to discipline the local clock. */
+  (void)ptpd_inject_sync(0, payload, (size_t)payload_len);
 }
 
 static void wifi_sta_init(void) {
@@ -319,6 +419,15 @@ static void ftm_client_task(void *arg) {
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
+    static bool s_logged_ap_caps = false;
+    if (!s_logged_ap_caps) {
+      ESP_LOGI(TAG, "AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u "
+                    "ftm_responder=%d (advertised in beacon)",
+               ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2],
+               ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5],
+               ap_info.primary, ap_info.ftm_responder);
+      s_logged_ap_caps = true;
+    }
     wifi_ftm_initiator_cfg_t cfg = {
         .channel = ap_info.primary,
         .frm_count = AVB_FTM_FRM_COUNT,
@@ -348,9 +457,11 @@ static void start_wifi_endpoint(void) {
 
   s_wifi_events = xEventGroupCreate();
   wifi_sta_init();
-  /* FTM client task disabled to isolate the c6 stability issue.
-   * Re-enable once the AVB-stack-on-wifi flow is stable. */
-  /* xTaskCreate(ftm_client_task, "ftm_client", 4096, NULL, 5, NULL); */
+  /* Start FTM client task. Bursts the AP at ~5 Hz, the report handler
+   * feeds RTT/2 into ptpd_inject_peer_delay for the wifi_ftm port's
+   * servo. Compensates the static beacon-IE pipeline bias from §12.7
+   * Vendor IE rather than from real FTM HW timestamps. */
+  xTaskCreate(ftm_client_task, "ftm_client", 4096, NULL, 5, NULL);
 
   /* Wait for STA association before bringing up AVB so the RX callback that
    * avb_net_init registers (esp_wifi_internal_reg_rxcb) sees a
@@ -361,6 +472,20 @@ static void start_wifi_endpoint(void) {
   ESP_LOGI(TAG, "Waiting for STA association before starting AVB");
   xEventGroupWaitBits(s_wifi_events, BIT_STA_CONNECTED, pdFALSE, pdTRUE,
                       portMAX_DELAY);
+
+  /* Bootstrap ptpd on the wifi_ftm port. The daemon's clockIdentity
+   * is sourced from the STA's MAC (read in ptp_port_init_wifi_ftm via
+   * esp_wifi_get_mac(WIFI_IF_STA)) — Wi-Fi must already be running,
+   * which it is by this point. No L2TAP socket opens; Sync arrives
+   * via the §12.7 Vendor IE that on_vendor_ie() (registered above)
+   * decodes, peer-delay arrives via FTM and ptpd_inject_peer_delay
+   * (still to be wired). Interface label "WIFI_STA_DEF" matches the
+   * lwIP netif key the rest of the endpoint uses, but the daemon
+   * treats it purely as a label on this medium (no netif open). */
+  if (ptpd_start_port(0, "WIFI_STA_DEF", ptp_port_medium_wifi_ftm) < 0) {
+    ESP_LOGE(TAG, "ptpd_start_port wifi_ftm failed — wireless clock will "
+                  "not lock");
+  }
 
   avb_config_s avb_config = AVB_DEFAULT_CONFIG();
   avb_config.entity_name = CONFIG_EXAMPLE_AVB_ENTITY_NAME;
@@ -391,11 +516,11 @@ static void start_wifi_endpoint(void) {
  * ===========================================================================
  */
 void app_main(void) {
-#ifdef CONFIG_ESP_PTP_PORT0_MEDIUM_ETHERNET
+#ifdef CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS
   start_ethernet_endpoint();
 #endif
-#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI) ||                               \
-    defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI)
+#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM) ||                               \
+    defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI_FTM)
   start_wifi_endpoint();
 #endif
 

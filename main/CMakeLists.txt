@@ -11,7 +11,7 @@ set(srcs "avb_endpoint.c")
 if(IDF_TARGET STREQUAL "esp32c6")
     idf_component_register(SRCS ${srcs}
                            PRIV_REQUIRES esp_wifi esp_netif esp_event
-                                         nvs_flash esp_timer esp_avb)
+                                         nvs_flash esp_timer esp_avb esp_ptp)
 else()
     idf_component_register(SRCS ${srcs})
 endif()
