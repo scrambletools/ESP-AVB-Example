@@ -218,25 +218,75 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
   case WIFI_EVENT_FTM_REPORT: {
     wifi_event_ftm_report_t *r = (wifi_event_ftm_report_t *)data;
     if (r->status == FTM_STATUS_SUCCESS) {
-      /* peer_delay = RTT/2, in nanoseconds. IDF surfaces rtt_est in
-       * picoseconds despite the docstring saying "Nano-Seconds" on
-       * older releases — verified against tshark on FTM action
-       * frames. Convert to ns and inject into ptpd. */
-      int64_t peer_delay_ns = (int64_t)r->rtt_est / 2;
+      /* Per-entry rtt is picosecond-resolution; the aggregate rtt_est
+       * is integer nanoseconds, which truncates to 0 at bench distances
+       * where one-way delay is sub-ns. Average the valid per-entry rtt
+       * values (zeros are invalid samples filtered by IDF), halve for
+       * one-way, then round ps → ns at the ptpd boundary. */
+      uint64_t avg_rtt_ps = 0;
+      uint8_t valid = 0;
+      uint8_t n = r->ftm_report_num_entries;
+      if (n > 16) n = 16;
+      if (n) {
+        wifi_ftm_report_entry_t entries[16];
+        if (esp_wifi_ftm_get_report(entries, n) == ESP_OK) {
+          uint64_t sum_ps = 0;
+          for (uint8_t i = 0; i < n; ++i) {
+            if (entries[i].rtt) {
+              sum_ps += entries[i].rtt;
+              valid++;
+            }
+          }
+          if (valid) {
+            avg_rtt_ps = sum_ps / valid;
+          }
+        }
+      }
+      int64_t peer_delay_ns;
+      if (avg_rtt_ps) {
+        uint64_t one_way_ps = avg_rtt_ps / 2;
+        peer_delay_ns = (int64_t)((one_way_ps + 500) / 1000);
+      } else {
+        /* No per-entry data — fall back to ns-resolution aggregate. */
+        peer_delay_ns = (int64_t)r->rtt_est / 2;
+      }
       int rc = ptpd_inject_peer_delay(0, peer_delay_ns);
       static uint32_t s_seen = 0;
       if ((++s_seen % 25) == 1) {
         ESP_LOGI(TAG,
                  "FTM report #%u: peer %02x:%02x:%02x:%02x:%02x:%02x "
-                 "RTT_est=%u ps  peer_delay=%lld ns  inject_rc=%d",
+                 "RTT_est=%u ns  avg_rtt=%llu ps (%u/%u valid)  "
+                 "peer_delay=%lld ns  inject_rc=%d",
                  (unsigned)s_seen, r->peer_mac[0], r->peer_mac[1],
                  r->peer_mac[2], r->peer_mac[3], r->peer_mac[4],
                  r->peer_mac[5], (unsigned)r->rtt_est,
+                 (unsigned long long)avg_rtt_ps, valid, n,
                  (long long)peer_delay_ns, rc);
       }
       xEventGroupSetBits(s_wifi_events, BIT_FTM_REPORT_OK);
     } else {
       ESP_LOGW(TAG, "FTM session failed: status=%d", r->status);
+      /* Diagnostic dump of per-entry t1..t4 on the rare statuses where
+       * IDF still populates the report (e.g. NO_VALID_MSMT). Tells us
+       * which side is shipping zero/garbage timestamps. Rate-limited. */
+      static uint32_t s_fail = 0;
+      if (r->ftm_report_num_entries && (++s_fail % 5) == 1) {
+        wifi_ftm_report_entry_t entries[16];
+        uint8_t n = r->ftm_report_num_entries;
+        if (n > 16) n = 16;
+        if (esp_wifi_ftm_get_report(entries, n) == ESP_OK) {
+          for (uint8_t i = 0; i < n; ++i) {
+            const wifi_ftm_report_entry_t *e = &entries[i];
+            ESP_LOGW(TAG,
+                     "  entry %u: rssi=%d rtt=%u ps t1=%llu t2=%llu "
+                     "t3=%llu t4=%llu ppm=%d",
+                     i, e->rssi, (unsigned)e->rtt,
+                     (unsigned long long)e->t1, (unsigned long long)e->t2,
+                     (unsigned long long)e->t3, (unsigned long long)e->t4,
+                     e->ppm);
+          }
+        }
+      }
     }
     break;
   }
