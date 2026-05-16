@@ -654,12 +654,19 @@ static void start_wifi_endpoint(void) {
   avb_config.atdecc_control = CONFIG_EXAMPLE_AVB_REMOTE_CONTROL;
   avb_config.eth_handle = NULL;
   avb_config.eth_interface = "WIFI_STA_DEF";
-  /* c6 endpoint has no codec attached and the default codec pins
-   * (12/13) collide with the USB-serial peripheral. Skip I2S +
-   * codec init entirely, and zero the PA pin so identify-tone paths
-   * don't try to drive a nonexistent GPIO. */
-  avb_config.codec_disabled = true;
-  avb_config.codec_pins.pa = -1;
+  /* C6 test board's onboard ES8311 (per avbconfig.h comment block).
+   * Default codec pins (12/13 = MCLK/BCLK) collide with C6 USB-Serial-
+   * JTAG (D+/D-), so we override to the C6 board's actual ES8311
+   * wiring. None of these pins overlap with USB on the C6. */
+  avb_config.codec_pins.mclk = 19;
+  avb_config.codec_pins.bclk = 20;
+  avb_config.codec_pins.ws = 22;
+  avb_config.codec_pins.dout = 21;
+  avb_config.codec_pins.din = 23;
+  avb_config.codec_pins.i2c_sda = 8;
+  avb_config.codec_pins.i2c_scl = 7;
+  avb_config.codec_pins.pa = 6;
+  avb_config.codec_pins.pa_reverted = false;
 
   avb_start(&avb_config);
   ESP_LOGI(TAG, "AVB stack started on wifi port");
