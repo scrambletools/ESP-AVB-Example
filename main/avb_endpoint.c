@@ -63,10 +63,7 @@
 
 static const char *TAG = "avb_endpoint";
 
-/* ===========================================================================
- * ETHERNET medium (PORT0)
- * ===========================================================================
- */
+/* ETHERNET medium (PORT0) */
 #ifdef CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS
 
 static esp_eth_handle_t s_eth_handle;
@@ -142,6 +139,9 @@ static void start_ethernet_endpoint(void) {
   avb_config.atdecc_control = CONFIG_EXAMPLE_AVB_REMOTE_CONTROL;
   avb_config.eth_handle = s_eth_handle;
   avb_config.eth_interface = "ETH_0";
+#ifdef CONFIG_EXAMPLE_AVB_CODEC_DISABLED
+  avb_config.codec_disabled = true;
+#endif
 
   esp_eth_io_cmd_t cmd = ETH_CMD_S_PROMISCUOUS;
   bool promiscuous = true;
@@ -155,25 +155,21 @@ static void start_ethernet_endpoint(void) {
 
 #endif /* CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS */
 
-/* ===========================================================================
- * WIFI medium (PORT0 or PORT1), STA role
- * ===========================================================================
- * Wi-Fi STA associates to the bridge's SoftAP, consumes the bridge's
- * beacon Vendor IE (Path C FollowUpInformation), and runs an FTM
- * initiator burst at the §12.8.2 cadence. The full AVB stack
- * (talker/listener, ATDECC) runs on the Wi-Fi data plane via
- * avb_start() with codec disabled.
- */
+/* Wi-Fi medium (STA role).
+ * Associates to the bridge SoftAP, consumes the beacon Vendor IE
+ * FollowUpInformation, and runs an FTM initiator burst at the
+ * §12.8.2 cadence. Full AVB stack runs on the Wi-Fi data plane
+ * via avb_start() with codec disabled. */
 #if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM) ||                               \
     defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI_FTM)
 
 #define AVB_AP_SSID "ESP-AVB-Bridge"
 
-/* Beacon Vendor IE OUI / sub-types are defined in ptp_rpc_proto.h so
- * the bridge marshaller, bridge coprocessor handler, and this STA
- * parser stay in sync. PTP_VND_IE_OUI* + PTP_VND_IE_OUI_TYPE_FOLLOWUP
- * is the §12.7 IE; PTP_VND_IE_OUI_TYPE_TSF_MAPPING is the Plan-A
- * Scramble-Tools-private (gPTP,TSF) mapping IE. */
+/* Beacon Vendor IE OUI / sub-types shared with the bridge marshaller
+ * and coprocessor handler via ptp_rpc_proto.h.
+ *   PTP_VND_IE_OUI_TYPE_FOLLOWUP    — §12.7 IE
+ *   PTP_VND_IE_OUI_TYPE_TSF_MAPPING — Scramble-Tools-private
+ *                                     (gPTP, TSF) mapping IE */
 #include "ptp_rpc_proto.h"
 
 /* FTM cadence target. IEEE 802.1AS-2020 sets
@@ -192,23 +188,22 @@ static EventGroupHandle_t s_wifi_events;
 static uint8_t s_ap_bssid[6] = {0};
 static uint8_t s_ap_channel = 0;
 
-/* Plan A FTM-derived sync state. on_vendor_ie writes both markers as
- * IEs arrive; the WIFI_EVENT_FTM_REPORT success handler reads them
- * with the FTM measurement's t1 to compute GM time at the FTM TX
- * moment, then injects via ptpd_inject_sync_pair. The two IEs are
- * carried in the same beacon and processed back-to-back inside the
- * wifi event task, so the pair is naturally atomic.
+/* FTM-derived sync markers. on_vendor_ie writes both as IEs arrive;
+ * the FTM_REPORT success handler combines them with FTM t1 to
+ * compute BTC time at the FTM TX moment and injects via
+ * ptpd_inject_sync_pair. Both IEs ride the same beacon and are
+ * processed back-to-back, so the pair is naturally atomic.
  *
- *   s_plan_a_gptp_marker_ns: GM time at bridge marshal moment (from
- *                            §12.7 IE preciseOriginTimestamp).
- *   s_plan_a_tsf_marker_us:  bridge AP TSF µs at coprocessor publish
- *                            moment (from TSF mapping IE).
+ *   s_gptp_marker_ns: BTC time at bridge marshal moment (§12.7 IE
+ *                     preciseOriginTimestamp).
+ *   s_tsf_marker_us:  bridge AP TSF µs at coprocessor publish moment
+ *                     (TSF mapping IE).
  *
  * Both must be non-zero before the FTM handler uses the pair. */
-static int64_t s_plan_a_gptp_marker_ns = 0;
-static int64_t s_plan_a_tsf_marker_us = 0;
-static bool s_plan_a_seen_gptp = false;
-static bool s_plan_a_seen_tsf = false;
+static int64_t s_gptp_marker_ns = 0;
+static int64_t s_tsf_marker_us = 0;
+static bool s_seen_gptp = false;
+static bool s_seen_tsf = false;
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                           void *data) {
@@ -279,20 +274,18 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       }
       int rc = ptpd_inject_peer_delay(0, peer_delay_ns);
 
-      /* Plan A FTM-derived sync pair. If we have a fresh (gPTP, AP-TSF)
-       * mapping from the most recent beacon AND a valid FTM measurement
-       * this cycle, convert the bridge-side hardware-timestamped t1
-       * (in pSec on bridge TSF) into GM time, then back-project the
-       * STA's local clock to the FTM RX moment using t2. Feed the pair
-       * to the daemon's pair-injection API which runs the same servo
-       * machinery as the wired path. */
+      /* FTM-derived sync pair. With a fresh (gPTP, AP-TSF) mapping
+       * AND a valid FTM measurement, convert the bridge-side
+       * hardware-timestamped t1 (pSec on bridge TSF) into BTC time,
+       * then back-project the STA local clock to the FTM RX moment
+       * via t2. Pair-injection runs the same servo as the wired path. */
       int pair_rc = 0;
       int64_t t1_gPTP_ns = 0;
       int64_t local_at_RX_ns = 0;
-      if (s_plan_a_seen_gptp && s_plan_a_seen_tsf && best_t1_ps && best_t2_ps) {
+      if (s_seen_gptp && s_seen_tsf && best_t1_ps && best_t2_ps) {
         int64_t t1_us       = (int64_t)(best_t1_ps / 1000000ULL);
-        int64_t delta_us    = t1_us - s_plan_a_tsf_marker_us;
-        t1_gPTP_ns          = s_plan_a_gptp_marker_ns + delta_us * 1000;
+        int64_t delta_us    = t1_us - s_tsf_marker_us;
+        t1_gPTP_ns          = s_gptp_marker_ns + delta_us * 1000;
 
         int64_t t2_us       = (int64_t)(best_t2_ps / 1000000ULL);
         int64_t now_us      = esp_timer_get_time();
@@ -361,10 +354,9 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
  * (32 B, §11.4.4.3). Total = sizeof(ptp_follow_up_s) = 76 B.
  *
  * Today this is a validating decoder — it parses the wire bytes and
- * periodically logs the structured fields. The next step is to feed
- * the parsed Follow_Up into the local ptpd via ptpd_inject_sync(0,
- * payload, 76) so it disciplines the STA's clock; that requires the
- * daemon-side injection path to be wired up (tracked separately). */
+ * periodically logs the structured fields. Future work feeds the
+ * parsed Follow_Up into the local ptpd via ptpd_inject_sync(0,
+ * payload, 76) so it disciplines the STA clock. */
 static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                          const uint8_t sa[6], const vendor_ie_data_t *vnd_ie,
                          int rssi) {
@@ -382,11 +374,11 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
   int payload_len = (int)vnd_ie->length - 4;
   const uint8_t *payload = vnd_ie->payload;
 
-  /* Plan A: Scramble Tools (gPTP, AP-TSF) mapping IE. Stores the
-   * bridge's wifi MAC TSF µs (LE) captured by the coprocessor at
-   * publish time. Paired with the §12.7 preciseOriginTimestamp from
-   * the same beacon, the FTM handler uses (gPTP_marker, ap_tsf_marker)
-   * + measured t1 to compute GM time at the FTM TX moment. */
+  /* (gPTP, AP-TSF) mapping IE. Stores the bridge AP TSF µs (LE)
+   * captured at publish time. Paired with the §12.7 preciseOrigin-
+   * Timestamp from the same beacon, the FTM handler uses
+   * (gptp_marker, tsf_marker) + measured t1 to compute BTC time at
+   * the FTM TX moment. */
   if (vnd_ie->vendor_oui_type == PTP_VND_IE_OUI_TYPE_TSF_MAPPING) {
     if (payload_len < PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN) {
       return;
@@ -395,8 +387,8 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     for (int i = 0; i < 8; ++i) {
       tsf_us |= ((int64_t)payload[i]) << (8 * i);
     }
-    s_plan_a_tsf_marker_us = tsf_us;
-    s_plan_a_seen_tsf = true;
+    s_tsf_marker_us = tsf_us;
+    s_seen_tsf = true;
     static uint32_t s_tsf_ie_seen = 0;
     if ((++s_tsf_ie_seen % 25) == 1) {
       ESP_LOGI(TAG, "TSF mapping IE #%u: ap_tsf=%lld us",
@@ -474,11 +466,11 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
              (unsigned long)nsecs);
   }
 
-  /* Stash the §12.7 preciseOriginTimestamp as gPTP_marker for Plan A
-   * BEFORE the dedup check — dedup gates downstream inject_sync (to
-   * avoid aliasing the servo's rate estimate) but we want the marker
-   * to track the most-recent observed value on every beacon, even
-   * duplicates, so the FTM pair injection always uses a current pair. */
+  /* Stash the §12.7 preciseOriginTimestamp as gptp_marker BEFORE
+   * the dedup below — dedup gates downstream inject_sync (to avoid
+   * aliasing the servo's rate estimate) but we want the marker to
+   * track every beacon so FTM pair-injection always uses a current
+   * pair. */
   {
     uint64_t secs = 0;
     for (int i = 0; i < 6; i++) {
@@ -488,9 +480,9 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                      ((uint32_t)fu->origintimestamp[7] << 16) |
                      ((uint32_t)fu->origintimestamp[8] << 8) |
                      (uint32_t)fu->origintimestamp[9];
-    s_plan_a_gptp_marker_ns =
+    s_gptp_marker_ns =
         (int64_t)(secs * 1000000000ULL) + (int64_t)nsecs;
-    s_plan_a_seen_gptp = true;
+    s_seen_gptp = true;
   }
 
   /* Deduplicate against the previous-seen IE. Beacons fire every
@@ -507,13 +499,12 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
   }
   memcpy(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts));
 
-  /* Feed the Follow_Up into ptpd. inject_sync bootstraps the daemon —
-   * sets selected_source (so ptpd_inject_sync_pair has the GM identity
-   * it gates on) and jumps the SW clock from CLOCK_REALTIME=epoch up
-   * to GM time on the first beacon. After that, the FTM-derived pair
-   * injection (sub-ms precision) runs alongside this coarse beacon-IE
-   * injection. Both push the servo toward the same GM clock; in
-   * practice the servo converges to the FTM-precision regime. */
+  /* Feed Follow_Up into ptpd. inject_sync bootstraps the daemon —
+   * sets selected_source (so inject_sync_pair has the BTC identity
+   * it gates on) and jumps the SW clock to BTC time on the first
+   * beacon. After that the FTM-derived pair injection (sub-ms
+   * precision) runs alongside this coarse beacon-IE injection;
+   * the servo converges to the FTM-precision regime. */
   (void)ptpd_inject_sync(0, payload, (size_t)payload_len);
 }
 
@@ -634,8 +625,8 @@ static void start_wifi_endpoint(void) {
    * esp_wifi_get_mac(WIFI_IF_STA)) — Wi-Fi must already be running,
    * which it is by this point. No L2TAP socket opens; Sync arrives
    * via the §12.7 Vendor IE that on_vendor_ie() (registered above)
-   * decodes, peer-delay arrives via FTM and ptpd_inject_peer_delay
-   * (still to be wired). Interface label "WIFI_STA_DEF" matches the
+   * decodes, peer-delay arrives via FTM and ptpd_inject_peer_delay.
+   * Interface label "WIFI_STA_DEF" matches the
    * lwIP netif key the rest of the endpoint uses, but the daemon
    * treats it purely as a label on this medium (no netif open). */
   if (ptpd_start_port(0, "WIFI_STA_DEF", ptp_port_medium_wifi_ftm) < 0) {
@@ -674,11 +665,17 @@ static void start_wifi_endpoint(void) {
 
 #endif /* WIFI medium configured */
 
-/* ===========================================================================
- * Main
- * ===========================================================================
- */
 void app_main(void) {
+#ifdef CONFIG_AVB_ENDPOINT_PERF_TEST_MODE
+  /* Perf-test mode bypasses every production subsystem. Brings up only
+   * NVS + WiFi STA and counts matching AVTP frames via an
+   * esp_wifi_internal_reg_rxcb hook. Never returns to the production
+   * bring-up below. */
+  extern void avb_endpoint_perf_test_run(void);
+  avb_endpoint_perf_test_run();
+  return;
+#endif
+
 #ifdef CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS
   start_ethernet_endpoint();
 #endif

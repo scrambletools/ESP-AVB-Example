@@ -87,4 +87,60 @@ menu "AVB Example Configuration"
         help
             Allow an AVB Controller to control this device via ATDECC protocol. If not set it will break Milan compliance.
 
+    config EXAMPLE_AVB_CODEC_DISABLED
+        bool "Skip codec + I2S init (control plane only)"
+        default n
+        help
+            Set avb_config.codec_disabled=true so I2S and codec init
+            are skipped. Use on boards where the wired codec does not
+            match the default (e.g. an ES8388 hat on a P4-ETH host
+            where the default selection is ES8311). The control plane
+            — ATDECC, MSRP, MVRP, MAAP — runs unaffected; only audio
+            I/O is disabled. Used for control-plane reproduction
+            tests on hosts without matching audio hardware.
+
+    config AVB_ENDPOINT_PERF_TEST_MODE
+        bool "Perf-test mode (skip PTP/AVB/codec, count matching AVTP frames on WiFi STA)"
+        default n
+        depends on ESP_PTP_PORT0_MEDIUM_WIFI_FTM || ESP_PTP_PORT1_MEDIUM_WIFI_FTM
+        help
+            Replaces the production bring-up. Only NVS + esp_event + WiFi
+            STA come up; ptpd, AVB and the codec are NOT started. An
+            esp_wifi_internal_reg_rxcb hook counts AVTP frames whose
+            dest MAC + stream ID match the configured pair. A 1 Hz
+            stats task logs pps and Mbps. Pair with
+            CONFIG_AVB_BRIDGE_PERF_TEST_MODE on the bridge to measure
+            end-to-end throughput across SDIO + 802.11.
+
+            Visible only on builds where a WiFi STA medium is configured
+            (the C6 wireless endpoint build).
+
+    config AVB_ENDPOINT_PERF_TEST_DEST_MAC
+        string "Test destination MAC (six colon-separated hex octets)"
+        default "91:e0:f0:00:fe:00"
+        depends on AVB_ENDPOINT_PERF_TEST_MODE
+        help
+            Must match the bridge perf-test mode's DEST_MAC. Frames with
+            any other dest MAC are dropped at the filter and counted
+            separately so a mis-pair is visible in the heartbeat.
+
+    config AVB_ENDPOINT_PERF_TEST_STREAM_ID
+        string "Test AVTP stream ID (eight colon-separated hex octets)"
+        default "80:f1:b2:d2:ca:e0:00:01"
+        depends on AVB_ENDPOINT_PERF_TEST_MODE
+        help
+            Must match the bridge perf-test mode's STREAM_ID. Frames
+            with any other stream_id are dropped at the filter.
+
+    config AVB_ENDPOINT_PERF_TEST_DURATION_SEC
+        int "Test duration seconds (0 = run forever)"
+        default 10
+        range 0 86400
+        depends on AVB_ENDPOINT_PERF_TEST_MODE
+        help
+            Counted from the first matching RX. After expiry the stats
+            task prints a one-line summary and stops sampling; the WiFi
+            stack stays up so re-running the bridge side just needs a
+            board reset on the bridge.
+
 endmenu
