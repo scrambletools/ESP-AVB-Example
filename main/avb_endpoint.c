@@ -28,6 +28,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
+#include <esp_heap_trace.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <string.h>
@@ -165,46 +166,13 @@ static void start_ethernet_endpoint(void) {
 
 #define AVB_AP_SSID "ESP-AVB-Bridge"
 
-/* Beacon Vendor IE OUI / sub-types shared with the bridge marshaller
- * and coprocessor handler via ptp_rpc_proto.h.
- *   PTP_VND_IE_OUI_TYPE_FOLLOWUP    — §12.7 IE
- *   PTP_VND_IE_OUI_TYPE_TSF_MAPPING — Scramble-Tools-private
- *                                     (gPTP, TSF) mapping IE */
-#include "ptp_rpc_proto.h"
-
-/* FTM cadence target. IEEE 802.1AS-2020 sets
- * initialLogSyncInterval = -3 → 8 messages/s on Wi-Fi. The ESP-IDF
- * FTM API uses burst_period in 100 ms units (allowed: 0=No pref,
- * 2..100). We use 2 (= 200 ms ≈ 5 Hz) since 1 is below the
- * documented minimum. Each burst runs frm_count FTM frames; allowed
- * values are 0(No pref), 16, 24, 32, 64. */
-#define AVB_FTM_BURST_PERIOD_100MS 2
-#define AVB_FTM_FRM_COUNT 16
-
 static EventGroupHandle_t s_wifi_events;
 #define BIT_STA_CONNECTED BIT0
-#define BIT_FTM_REPORT_OK BIT1
 
-static uint8_t s_ap_bssid[6] = {0};
-static uint8_t s_ap_channel = 0;
-
-/* FTM-derived sync markers. on_vendor_ie writes both as IEs arrive;
- * the FTM_REPORT success handler combines them with FTM t1 to
- * compute BTC time at the FTM TX moment and injects via
- * ptpd_inject_sync_pair. Both IEs ride the same beacon and are
- * processed back-to-back, so the pair is naturally atomic.
- *
- *   s_gptp_marker_ns: BTC time at bridge marshal moment (§12.7 IE
- *                     preciseOriginTimestamp).
- *   s_tsf_marker_us:  bridge AP TSF µs at coprocessor publish moment
- *                     (TSF mapping IE).
- *
- * Both must be non-zero before the FTM handler uses the pair. */
-static int64_t s_gptp_marker_ns = 0;
-static int64_t s_tsf_marker_us = 0;
-static bool s_seen_gptp = false;
-static bool s_seen_tsf = false;
-
+/* Application-side Wi-Fi housekeeping. Connect/reconnect logic and a
+ * connection-ready signal that start_wifi_endpoint waits on before
+ * bringing up the AVB stack. All §12.7 / FTM handling lives inside
+ * esp_ptp's ptp_wifi_sta module — see ptp_wifi_sta.c. */
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                           void *data) {
   (void)arg;
@@ -216,8 +184,6 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
     break;
   case WIFI_EVENT_STA_CONNECTED: {
     wifi_event_sta_connected_t *e = (wifi_event_sta_connected_t *)data;
-    memcpy(s_ap_bssid, e->bssid, 6);
-    s_ap_channel = e->channel;
     ESP_LOGI(TAG, "Associated. BSSID %02x:%02x:%02x:%02x:%02x:%02x channel %u",
              e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4],
              e->bssid[5], e->channel);
@@ -229,283 +195,9 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
     xEventGroupClearBits(s_wifi_events, BIT_STA_CONNECTED);
     esp_wifi_connect();
     break;
-  case WIFI_EVENT_FTM_REPORT: {
-    wifi_event_ftm_report_t *r = (wifi_event_ftm_report_t *)data;
-    if (r->status == FTM_STATUS_SUCCESS) {
-      /* Per-entry rtt is picosecond-resolution; the aggregate rtt_est
-       * is integer nanoseconds, which truncates to 0 at bench distances
-       * where one-way delay is sub-ns. Average the valid per-entry rtt
-       * values (zeros are invalid samples filtered by IDF), halve for
-       * one-way, then round ps → ns at the ptpd boundary. */
-      uint64_t avg_rtt_ps = 0;
-      uint8_t valid = 0;
-      uint8_t n = r->ftm_report_num_entries;
-      if (n > 16) n = 16;
-      uint64_t best_t1_ps = 0;
-      uint64_t best_t2_ps = 0;
-      if (n) {
-        wifi_ftm_report_entry_t entries[16];
-        if (esp_wifi_ftm_get_report(entries, n) == ESP_OK) {
-          uint64_t sum_ps = 0;
-          int last_valid = -1;
-          for (uint8_t i = 0; i < n; ++i) {
-            if (entries[i].rtt) {
-              sum_ps += entries[i].rtt;
-              valid++;
-              last_valid = i;
-            }
-          }
-          if (valid) {
-            avg_rtt_ps = sum_ps / valid;
-          }
-          if (last_valid >= 0) {
-            best_t1_ps = entries[last_valid].t1;
-            best_t2_ps = entries[last_valid].t2;
-          }
-        }
-      }
-      int64_t peer_delay_ns;
-      if (avg_rtt_ps) {
-        uint64_t one_way_ps = avg_rtt_ps / 2;
-        peer_delay_ns = (int64_t)((one_way_ps + 500) / 1000);
-      } else {
-        /* No per-entry data — fall back to ns-resolution aggregate. */
-        peer_delay_ns = (int64_t)r->rtt_est / 2;
-      }
-      int rc = ptpd_inject_peer_delay(0, peer_delay_ns);
-
-      /* FTM-derived sync pair. With a fresh (gPTP, AP-TSF) mapping
-       * AND a valid FTM measurement, convert the bridge-side
-       * hardware-timestamped t1 (pSec on bridge TSF) into BTC time,
-       * then back-project the STA local clock to the FTM RX moment
-       * via t2. Pair-injection runs the same servo as the wired path. */
-      int pair_rc = 0;
-      int64_t t1_gPTP_ns = 0;
-      int64_t local_at_RX_ns = 0;
-      if (s_seen_gptp && s_seen_tsf && best_t1_ps && best_t2_ps) {
-        int64_t t1_us       = (int64_t)(best_t1_ps / 1000000ULL);
-        int64_t delta_us    = t1_us - s_tsf_marker_us;
-        t1_gPTP_ns          = s_gptp_marker_ns + delta_us * 1000;
-
-        int64_t t2_us       = (int64_t)(best_t2_ps / 1000000ULL);
-        int64_t now_us      = esp_timer_get_time();
-        struct timespec swn = {0};
-        ptpd_now(&swn);
-        int64_t sw_now_ns   = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
-        local_at_RX_ns      = sw_now_ns - (now_us - t2_us) * 1000;
-
-        pair_rc = ptpd_inject_sync_pair(0, t1_gPTP_ns, local_at_RX_ns);
-      }
-
-      static uint32_t s_seen = 0;
-      if ((++s_seen % 25) == 1) {
-        ESP_LOGI(TAG,
-                 "FTM report #%u: peer %02x:%02x:%02x:%02x:%02x:%02x "
-                 "RTT_est=%u ns  avg_rtt=%llu ps (%u/%u valid)  "
-                 "peer_delay=%lld ns  inject_rc=%d  "
-                 "pair_rc=%d t1_gPTP=%lld local_RX=%lld",
-                 (unsigned)s_seen, r->peer_mac[0], r->peer_mac[1],
-                 r->peer_mac[2], r->peer_mac[3], r->peer_mac[4],
-                 r->peer_mac[5], (unsigned)r->rtt_est,
-                 (unsigned long long)avg_rtt_ps, valid, n,
-                 (long long)peer_delay_ns, rc, pair_rc,
-                 (long long)t1_gPTP_ns, (long long)local_at_RX_ns);
-      }
-      xEventGroupSetBits(s_wifi_events, BIT_FTM_REPORT_OK);
-    } else {
-      ESP_LOGW(TAG, "FTM session failed: status=%d", r->status);
-      /* Diagnostic dump of per-entry t1..t4 on the rare statuses where
-       * IDF still populates the report (e.g. NO_VALID_MSMT). Tells us
-       * which side is shipping zero/garbage timestamps. Rate-limited. */
-      static uint32_t s_fail = 0;
-      if (r->ftm_report_num_entries && (++s_fail % 5) == 1) {
-        wifi_ftm_report_entry_t entries[16];
-        uint8_t n = r->ftm_report_num_entries;
-        if (n > 16) n = 16;
-        if (esp_wifi_ftm_get_report(entries, n) == ESP_OK) {
-          for (uint8_t i = 0; i < n; ++i) {
-            const wifi_ftm_report_entry_t *e = &entries[i];
-            ESP_LOGW(TAG,
-                     "  entry %u: rssi=%d rtt=%u ps t1=%llu t2=%llu "
-                     "t3=%llu t4=%llu ppm=%d",
-                     i, e->rssi, (unsigned)e->rtt,
-                     (unsigned long long)e->t1, (unsigned long long)e->t2,
-                     (unsigned long long)e->t3, (unsigned long long)e->t4,
-                     e->ppm);
-          }
-        }
-      }
-    }
-    break;
-  }
   default:
     break;
   }
-}
-
-/* Vendor IE callback — fires for every Vendor IE in scanned/received
- * beacons and probe responses. Filters to our OUI + Type 0 (§12.7
- * "FollowUpInformation" Vendor IE) and decodes the embedded Follow_Up
- * message.
- *
- * Per IEEE 802.1AS-2020 §12.7, the IE payload is an entire 802.1AS
- * Follow_Up message: PTP common header (34 B, §10.6.2) +
- * preciseOriginTimestamp (10 B, §11.4.4) + FollowUpInformation TLV
- * (32 B, §11.4.4.3). Total = sizeof(ptp_follow_up_s) = 76 B.
- *
- * Today this is a validating decoder — it parses the wire bytes and
- * periodically logs the structured fields. Future work feeds the
- * parsed Follow_Up into the local ptpd via ptpd_inject_sync(0,
- * payload, 76) so it disciplines the STA clock. */
-static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
-                         const uint8_t sa[6], const vendor_ie_data_t *vnd_ie,
-                         int rssi) {
-  (void)ctx;
-  if (type != WIFI_VND_IE_TYPE_BEACON) {
-    return;
-  }
-  if (vnd_ie->vendor_oui[0] != PTP_VND_IE_OUI0 ||
-      vnd_ie->vendor_oui[1] != PTP_VND_IE_OUI1 ||
-      vnd_ie->vendor_oui[2] != PTP_VND_IE_OUI2) {
-    return;
-  }
-  /* vnd_ie->length covers OUI(3) + oui_type(1) + payload, so payload
-   * size is length - 4. */
-  int payload_len = (int)vnd_ie->length - 4;
-  const uint8_t *payload = vnd_ie->payload;
-
-  /* (gPTP, AP-TSF) mapping IE. Stores the bridge AP TSF µs (LE)
-   * captured at publish time. Paired with the §12.7 preciseOrigin-
-   * Timestamp from the same beacon, the FTM handler uses
-   * (gptp_marker, tsf_marker) + measured t1 to compute BTC time at
-   * the FTM TX moment. */
-  if (vnd_ie->vendor_oui_type == PTP_VND_IE_OUI_TYPE_TSF_MAPPING) {
-    if (payload_len < PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN) {
-      return;
-    }
-    int64_t tsf_us = 0;
-    for (int i = 0; i < 8; ++i) {
-      tsf_us |= ((int64_t)payload[i]) << (8 * i);
-    }
-    s_tsf_marker_us = tsf_us;
-    s_seen_tsf = true;
-    static uint32_t s_tsf_ie_seen = 0;
-    if ((++s_tsf_ie_seen % 25) == 1) {
-      ESP_LOGI(TAG, "TSF mapping IE #%u: ap_tsf=%lld us",
-               (unsigned)s_tsf_ie_seen, (long long)tsf_us);
-    }
-    return;
-  }
-
-  if (vnd_ie->vendor_oui_type != PTP_VND_IE_OUI_TYPE_FOLLOWUP) {
-    return;
-  }
-
-  static uint32_t s_seen = 0;
-  ++s_seen;
-
-  /* Validate size against an 802.1AS-2020 §12.7 Follow_Up payload. */
-  if (payload_len != (int)sizeof(struct ptp_follow_up_s)) {
-    if ((s_seen % 50) == 1) {
-      ESP_LOGW(TAG,
-               "Beacon Vendor IE from %02x:%02x:%02x:%02x:%02x:%02x: "
-               "payload %d B (expected %u for §12.7 Follow_Up). Skipped.",
-               sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], payload_len,
-               (unsigned)sizeof(struct ptp_follow_up_s));
-    }
-    return;
-  }
-
-  const struct ptp_follow_up_s *fu = (const struct ptp_follow_up_s *)payload;
-  const struct ptp_header_s *h = &fu->header;
-
-  /* Sanity-check the messagetype nibble (low 4 bits) matches Follow_Up.
-   * In the gPTP profile the high nibble carries the gPTP majorSdoId; we
-   * mask it off before comparing. */
-  if ((h->messagetype & 0x0f) != 0x08 /* PTP_MSGTYPE_FOLLOW_UP */) {
-    if ((s_seen % 50) == 1) {
-      ESP_LOGW(TAG,
-               "Beacon Vendor IE payload messagetype 0x%02x, not Follow_Up; "
-               "skipped.",
-               h->messagetype);
-    }
-    return;
-  }
-
-  /* Decode and log every Nth beacon. RX timestamp would come from the
-   * radio for true §12 timing — esp_wifi_set_vendor_ie_cb doesn't
-   * surface it, so we settle for clock_gettime() at callback time
-   * (worse precision than FTM HW timestamps; matches our chosen
-   * carrier-deviation tradeoff). */
-  if ((s_seen % 50) == 1) {
-    /* sourcePortIdentity: 8-byte clockIdentity + 2-byte portNumber. */
-    const uint8_t *gm = h->sourceidentity;
-    uint16_t seq = ((uint16_t)h->sequenceid[0] << 8) | h->sequenceid[1];
-    /* correctionField (8 B, scaledNs): high 6 B = ns, low 2 B = 2^-16 ns. */
-    int64_t correction_ns = 0;
-    for (int i = 0; i < 6; i++) {
-      correction_ns = (correction_ns << 8) | h->correction[i];
-    }
-    /* preciseOriginTimestamp: 6-byte seconds + 4-byte nanoseconds. */
-    uint64_t secs = 0;
-    for (int i = 0; i < 6; i++) {
-      secs = (secs << 8) | fu->origintimestamp[i];
-    }
-    uint32_t nsecs = ((uint32_t)fu->origintimestamp[6] << 24) |
-                     ((uint32_t)fu->origintimestamp[7] << 16) |
-                     ((uint32_t)fu->origintimestamp[8] << 8) |
-                     (uint32_t)fu->origintimestamp[9];
-
-    ESP_LOGI(TAG,
-             "§12.7 Follow_Up @beacon from %02x:%02x:%02x:%02x:%02x:%02x "
-             "RSSI=%d seen=%u: GM clockIdentity=%02x:%02x:%02x:%02x:%02x:%02x:"
-             "%02x:%02x seqId=%u correction=%lld ns precTS=%llu.%09lu",
-             sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], rssi, (unsigned)s_seen,
-             gm[0], gm[1], gm[2], gm[3], gm[4], gm[5], gm[6], gm[7],
-             (unsigned)seq, (long long)correction_ns, (unsigned long long)secs,
-             (unsigned long)nsecs);
-  }
-
-  /* Stash the §12.7 preciseOriginTimestamp as gptp_marker BEFORE
-   * the dedup below — dedup gates downstream inject_sync (to avoid
-   * aliasing the servo's rate estimate) but we want the marker to
-   * track every beacon so FTM pair-injection always uses a current
-   * pair. */
-  {
-    uint64_t secs = 0;
-    for (int i = 0; i < 6; i++) {
-      secs = (secs << 8) | fu->origintimestamp[i];
-    }
-    uint32_t nsecs = ((uint32_t)fu->origintimestamp[6] << 24) |
-                     ((uint32_t)fu->origintimestamp[7] << 16) |
-                     ((uint32_t)fu->origintimestamp[8] << 8) |
-                     (uint32_t)fu->origintimestamp[9];
-    s_gptp_marker_ns =
-        (int64_t)(secs * 1000000000ULL) + (int64_t)nsecs;
-    s_seen_gptp = true;
-  }
-
-  /* Deduplicate against the previous-seen IE. Beacons fire every
-   * ~100 ms (AP DTIM cadence) but the bridge only re-marshals the IE
-   * every Sync interval (125 ms by default). So most beacons re-carry
-   * the prior Sync's bytes; reprocessing them aliases the servo's
-   * rate estimate. Skip when the preciseOriginTimestamp is unchanged
-   * — that's the high-entropy field that always advances on a fresh
-   * marshal. */
-  static uint8_t s_last_origin_ts[10] = {0};
-  if (memcmp(s_last_origin_ts, fu->origintimestamp,
-             sizeof(s_last_origin_ts)) == 0) {
-    return;
-  }
-  memcpy(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts));
-
-  /* Feed Follow_Up into ptpd. inject_sync bootstraps the daemon —
-   * sets selected_source (so inject_sync_pair has the BTC identity
-   * it gates on) and jumps the SW clock to BTC time on the first
-   * beacon. After that the FTM-derived pair injection (sub-ms
-   * precision) runs alongside this coarse beacon-IE injection;
-   * the servo converges to the FTM-precision regime. */
-  (void)ptpd_inject_sync(0, payload, (size_t)payload_len);
 }
 
 static void wifi_sta_init(void) {
@@ -538,62 +230,7 @@ static void wifi_sta_init(void) {
   ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                              &on_wifi_event, NULL));
 
-  /* Register Vendor IE RX callback. Fires for any IE in beacons/probe
-   * responses; we filter to our OUI inside the handler. */
-  ESP_ERROR_CHECK(esp_wifi_set_vendor_ie_cb(on_vendor_ie, NULL));
-
   ESP_ERROR_CHECK(esp_wifi_start());
-}
-
-/* FTM client task — initiates one burst per cadence interval against
- * the associated AP. Per IEEE 802.1AS-2020 §12.1.2, the client drives
- * the FTM exchange and uses the t1..t4 timestamps to compute peer
- * delay. */
-static void ftm_client_task(void *arg) {
-  (void)arg;
-  xEventGroupWaitBits(s_wifi_events, BIT_STA_CONNECTED, pdFALSE, pdTRUE,
-                      portMAX_DELAY);
-  ESP_LOGI(TAG, "FTM client starting");
-
-  while (true) {
-    if ((xEventGroupGetBits(s_wifi_events) & BIT_STA_CONNECTED) == 0) {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-
-    wifi_ap_record_t ap_info = {0};
-    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-    static bool s_logged_ap_caps = false;
-    if (!s_logged_ap_caps) {
-      ESP_LOGI(TAG, "AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u "
-                    "ftm_responder=%d (advertised in beacon)",
-               ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2],
-               ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5],
-               ap_info.primary, ap_info.ftm_responder);
-      s_logged_ap_caps = true;
-    }
-    wifi_ftm_initiator_cfg_t cfg = {
-        .channel = ap_info.primary,
-        .frm_count = AVB_FTM_FRM_COUNT,
-        .burst_period = AVB_FTM_BURST_PERIOD_100MS,
-    };
-    memcpy(cfg.resp_mac, ap_info.bssid, 6);
-    esp_err_t r = esp_wifi_ftm_initiate_session(&cfg);
-    if (r != ESP_OK) {
-      ESP_LOGW(TAG, "esp_wifi_ftm_initiate_session: %s", esp_err_to_name(r));
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-    xEventGroupWaitBits(s_wifi_events, BIT_FTM_REPORT_OK, pdTRUE, pdFALSE,
-                        pdMS_TO_TICKS(2000));
-    /* §12.8.2 sets the AS cadence at logSyncInterval=-3 = 8 Hz. The
-     * IDF FTM API's burst_period (in 100 ms units) defines burst
-     * spacing; we sleep one period between sessions. */
-    vTaskDelay(pdMS_TO_TICKS(AVB_FTM_BURST_PERIOD_100MS * 100));
-  }
 }
 
 static void start_wifi_endpoint(void) {
@@ -604,11 +241,6 @@ static void start_wifi_endpoint(void) {
 
   s_wifi_events = xEventGroupCreate();
   wifi_sta_init();
-  /* Start FTM client task. Bursts the AP at ~5 Hz, the report handler
-   * feeds RTT/2 into ptpd_inject_peer_delay for the wifi_ftm port's
-   * servo. Compensates the static beacon-IE pipeline bias from §12.7
-   * Vendor IE rather than from real FTM HW timestamps. */
-  xTaskCreate(ftm_client_task, "ftm_client", 4096, NULL, 5, NULL);
 
   /* Wait for STA association before bringing up AVB so the RX callback that
    * avb_net_init registers (esp_wifi_internal_reg_rxcb) sees a
@@ -620,15 +252,14 @@ static void start_wifi_endpoint(void) {
   xEventGroupWaitBits(s_wifi_events, BIT_STA_CONNECTED, pdFALSE, pdTRUE,
                       portMAX_DELAY);
 
-  /* Bootstrap ptpd on the wifi_ftm port. The daemon's clockIdentity
-   * is sourced from the STA's MAC (read in ptp_port_init_wifi_ftm via
-   * esp_wifi_get_mac(WIFI_IF_STA)) — Wi-Fi must already be running,
-   * which it is by this point. No L2TAP socket opens; Sync arrives
-   * via the §12.7 Vendor IE that on_vendor_ie() (registered above)
-   * decodes, peer-delay arrives via FTM and ptpd_inject_peer_delay.
-   * Interface label "WIFI_STA_DEF" matches the
-   * lwIP netif key the rest of the endpoint uses, but the daemon
-   * treats it purely as a label on this medium (no netif open). */
+  /* Bootstrap ptpd on the wifi_ftm port. esp_ptp internally spawns
+   * the §12.7 beacon-IE parser, the FTM initiator burst loop, and
+   * the FTM_REPORT handler that feeds inject_peer_delay +
+   * inject_sync_pair (see ptp_wifi_sta.c). The application no longer
+   * touches §12.7 IE bytes or FTM cadence. Interface label
+   * "WIFI_STA_DEF" matches the lwIP netif key the rest of the
+   * endpoint uses; the daemon treats it as a label on this medium
+   * (no netif open). */
   if (ptpd_start_port(0, "WIFI_STA_DEF", ptp_port_medium_wifi_ftm) < 0) {
     ESP_LOGE(TAG, "ptpd_start_port wifi_ftm failed — wireless clock will "
                   "not lock");
@@ -665,6 +296,25 @@ static void start_wifi_endpoint(void) {
 
 #endif /* WIFI medium configured */
 
+#ifdef CONFIG_HEAP_TRACING_STANDALONE
+static volatile bool s_heap_trace_dump_pending = false;
+
+void avb_endpoint_heap_trace_start(void *arg) {
+  (void)arg;
+  esp_err_t r = heap_trace_start(HEAP_TRACE_LEAKS);
+  ESP_LOGW(TAG, "heap_trace_start: %s", esp_err_to_name(r));
+}
+
+/* esp_timer callbacks run in a high-priority task with a short watchdog
+ * — dumping hundreds of records blocks too long and panics. Defer to
+ * the main heartbeat task. */
+void avb_endpoint_heap_trace_stop(void *arg) {
+  (void)arg;
+  heap_trace_stop();
+  s_heap_trace_dump_pending = true;
+}
+#endif
+
 void app_main(void) {
 #ifdef CONFIG_AVB_ENDPOINT_PERF_TEST_MODE
   /* Perf-test mode bypasses every production subsystem. Brings up only
@@ -684,6 +334,41 @@ void app_main(void) {
   start_wifi_endpoint();
 #endif
 
+#ifdef CONFIG_HEAP_TRACING_STANDALONE
+  /* Leak-hunt scaffold: start tracing after the boot transient
+   * quiesces, stop+flag after HEAP_TRACE_DURATION_S. Pair with the
+   * hexdump loop further down — backtraces are empty on RISC-V for
+   * the wifi blob's alloc sites, so we identify by buffer content. */
+  #define HEAP_TRACE_RECORDS       128
+  #define HEAP_TRACE_START_DELAY_S 30
+  #define HEAP_TRACE_DURATION_S    15
+  static heap_trace_record_t s_trace_buf[HEAP_TRACE_RECORDS];
+  if (heap_trace_init_standalone(s_trace_buf, HEAP_TRACE_RECORDS) != ESP_OK) {
+    ESP_LOGE(TAG, "heap_trace_init_standalone failed");
+  } else {
+    static esp_timer_handle_t s_start_timer, s_stop_timer;
+    const esp_timer_create_args_t start_args = {
+        .callback = &avb_endpoint_heap_trace_start,
+        .name = "heap_trace_start",
+    };
+    const esp_timer_create_args_t stop_args = {
+        .callback = &avb_endpoint_heap_trace_stop,
+        .name = "heap_trace_stop",
+    };
+    esp_timer_create(&start_args, &s_start_timer);
+    esp_timer_create(&stop_args, &s_stop_timer);
+    esp_timer_start_once(s_start_timer,
+                         (uint64_t)HEAP_TRACE_START_DELAY_S * 1000000ULL);
+    esp_timer_start_once(
+        s_stop_timer,
+        (uint64_t)(HEAP_TRACE_START_DELAY_S + HEAP_TRACE_DURATION_S) *
+            1000000ULL);
+    ESP_LOGI(TAG, "Heap trace scheduled: start @%ds, dump @%ds",
+             HEAP_TRACE_START_DELAY_S,
+             HEAP_TRACE_START_DELAY_S + HEAP_TRACE_DURATION_S);
+  }
+#endif
+
   vTaskDelay(pdMS_TO_TICKS(3000));
 
   /* Task handles for memory consumption monitoring */
@@ -699,6 +384,34 @@ void app_main(void) {
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(task_monitor_period));
     ESP_LOGI(TAG, "heartbeat");
+#ifdef CONFIG_HEAP_TRACING_STANDALONE
+    if (s_heap_trace_dump_pending) {
+      s_heap_trace_dump_pending = false;
+      /* Skip heap_trace_dump() — its esp_rom_printf hammers UART and
+       * trips the interrupt watchdog. Iterate via the public API,
+       * print one ESP_LOG per record with a yield in between, and
+       * hexdump the first 32 bytes so leaks can be identified by
+       * content (backtraces are empty on RISC-V wifi-blob allocs
+       * even with FRAME_POINTER on). */
+      size_t cnt = heap_trace_get_count();
+      ESP_LOGW(TAG, "=== HEAP LEAK HEXDUMP (%u records) ===",
+               (unsigned)cnt);
+      for (size_t i = 0; i < cnt; i++) {
+        heap_trace_record_t rec;
+        if (heap_trace_get(i, &rec) != ESP_OK) continue;
+        if (rec.size == 0 || rec.address == NULL) continue;
+        size_t n = rec.size < 32 ? rec.size : 32;
+        char hex[3 * 32 + 8] = {0};
+        for (size_t j = 0; j < n; j++) {
+          snprintf(hex + 3 * j, 4, "%02x ", ((uint8_t *)rec.address)[j]);
+        }
+        ESP_LOGW(TAG, "  leak[%u] size=%u @%p : %s", (unsigned)i,
+                 (unsigned)rec.size, rec.address, hex);
+        vTaskDelay(pdMS_TO_TICKS(20));
+      }
+      ESP_LOGW(TAG, "=== HEAP LEAK HEXDUMP END ===");
+    }
+#endif
 
     if (t0 && uxTaskGetStackHighWaterMark(t0) < task_monitor_threshold)
       ESP_LOGI(TAG, "TASK %s high water mark = %d", t0_name,

@@ -40,3 +40,14 @@ CONFIG_ESP_WIFI_RX_BA_WIN=64
 # AND WIN <= 2 * STATIC_RX_BUFFER_NUM.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=32
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+
+# Heap-trace is off by default. The scaffold in avb_endpoint.c
+# (#ifdef CONFIG_HEAP_TRACING_STANDALONE) and the heap-watcher log in
+# esp_avb/avbstats.c stay in the source so future leak investigations
+# are a single Kconfig toggle away. To re-enable, set:
+#   CONFIG_HEAP_TRACING_STANDALONE=y
+#   CONFIG_HEAP_TRACING_STACK_DEPTH=6
+#   CONFIG_ESP_SYSTEM_USE_FRAME_POINTER=y
+# in the active sdkconfig (not just defaults).
+CONFIG_HEAP_TRACING_OFF=y
+# CONFIG_HEAP_TRACING_STANDALONE is not set
