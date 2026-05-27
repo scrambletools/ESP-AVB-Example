@@ -144,6 +144,25 @@ static void start_ethernet_endpoint(void) {
   avb_config.codec_disabled = true;
 #endif
 
+#ifdef CONFIG_EXAMPLE_AVB_CODEC_ES8388_HAT
+  /* Override the default ES8311 onboard codec selection + pins with
+   * the Scramble Hat ES8388 wiring (pinout documented in
+   * esp_avb/avbconfig.h's "Scramble Hat" comment block). codec_type
+   * is const-qualified in avb_config_s — cast away const for this
+   * init-time override; nothing reads codec_type before avb_start()
+   * runs so the one-shot mutation is safe. */
+  *(avb_codec_type_t *)&avb_config.codec_type = avb_codec_type_es8388;
+  avb_config.codec_pins.mclk    = 16;
+  avb_config.codec_pins.bclk    = 17;
+  avb_config.codec_pins.ws      = 19;
+  avb_config.codec_pins.dout    = 18;
+  avb_config.codec_pins.din     = 54;
+  avb_config.codec_pins.i2c_sda = 21;
+  avb_config.codec_pins.i2c_scl = 20;
+  avb_config.codec_pins.pa      = -1;
+  avb_config.codec_pins.pa_reverted = false;
+#endif
+
   esp_eth_io_cmd_t cmd = ETH_CMD_S_PROMISCUOUS;
   bool promiscuous = true;
   if (esp_eth_ioctl(s_eth_handle, cmd, &promiscuous) != ESP_OK) {
